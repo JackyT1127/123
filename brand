@@ -1,0 +1,687 @@
+import streamlit as st
+import pandas as pd
+from rapidfuzz import fuzz, process
+from pathlib import Path
+import numpy as np
+from typing import Optional, Tuple, List
+import io
+import json
+from datetime import datetime
+import hashlib
+import os
+from functools import lru_cache
+import streamlit.components.v1 as components
+
+# 設置頁面配置
+st.set_page_config(
+    page_title="Green Ladies 品牌價格查詢系統",
+    layout="wide",
+    initial_sidebar_state="expanded"
+)
+
+# 自定義CSS樣式
+st.markdown("""
+<style>
+    .main {
+        background-color: #F5F5F5;
+    }
+    .stButton>button {
+        background-color: #E8F0FE;
+        color: #31333F;
+    }
+    .highlight {
+        font-size: 16px;
+        font-weight: bold;
+        color: black;
+        padding: 10px;
+        border-radius: 5px;
+        background-color: #f8f9fa;
+    }
+    .result-card {
+        padding: 20px;
+        background-color: white;
+        border-radius: 10px;
+        margin: 10px 0;
+        box-shadow: 0 2px 4px rgba(0,0,0,0.1);
+        color: black;
+        font-size: 16px;
+        animation: fadeIn 0.5s;
+    }
+    @keyframes fadeIn {
+        from { opacity: 0; }
+        to { opacity: 1; }
+    }
+    .result-card p {
+        color: black;
+        font-size: 16px;
+        margin: 8px 0;
+    }
+    .big-text {
+        font-size: 16px;
+        color: black;
+    }
+    .error-message {
+        color: #D32F2F;
+        background-color: #FFEBEE;
+        padding: 10px;
+        border-radius: 5px;
+        margin: 10px 0;
+    }
+    .success-message {
+        color: #1B5E20;
+        background-color: #E8F5E9;
+        padding: 10px;
+        border-radius: 5px;
+        margin: 10px 0;
+    }
+    .gl-price {
+        color: red;
+        font-size: 16px;
+        font-weight: bold;
+    }
+    .category-style {
+        color: red;
+        font-size: 16px;
+        font-weight: bold;
+    }
+    .result-card .highlight p:last-child {
+        color: red !important;
+        font-size: 20px !important;
+    }
+    .search-button button {
+        background-color: #4CAF50 !important;
+        color: white !important;
+        font-weight: bold !important;
+    }
+    .confirm-button button {
+        background-color: #FF9800 !important;
+        color: white !important;
+        font-weight: bold !important;
+    }
+    .match-score {
+        font-size: 14px;
+        color: #666;
+        font-style: italic;
+    }
+    .high-match {
+        color: #4CAF50;
+        font-weight: bold;
+    }
+    .medium-match {
+        color: #FF9800;
+    }
+    .low-match {
+        color: #F44336;
+    }
+    .loading {
+        display: inline-block;
+        width: 20px;
+        height: 20px;
+        border: 3px solid rgba(0,0,0,.3);
+        border-radius: 50%;
+        border-top-color: #4CAF50;
+        animation: spin 1s ease-in-out infinite;
+    }
+    @keyframes spin {
+        to { transform: rotate(360deg); }
+    }
+    .stTextInput input:focus {
+        box-shadow: 0 0 0 2px rgba(76, 175, 80, 0.5);
+        border-color: #4CAF50;
+    }
+    .search-form {
+        padding: 0 !important;
+        margin: 0 !important;
+    }
+    .brand-select {
+        margin-top: 10px;
+        margin-bottom: 10px;
+    }
+    .stats-section {
+        background-color: #E3F2FD;
+        padding: 15px;
+        border-radius: 5px;
+        margin-bottom: 20px;
+    }
+    table {
+        width: 100%;
+        border-collapse: collapse;
+        border: 2px solid black !important;        /* 外框粗黑線 */
+        margin: 15px 0;
+    }
+    th, td {
+        border: 1px solid black !important;
+        padding: 8px;
+        text-align: left;
+    }
+    th {
+        background-color: #d3d3d3;
+    }
+    .glb-column {
+        background-color: #add8e6;
+    }
+    .glf-column {
+        background-color: #90ee90;
+    }
+    th.glb-column {
+        background-color: #8ab9d1;
+    }
+    th.glf-column {
+        background-color: #76c776;
+    }
+</style>
+""", unsafe_allow_html=True)
+
+# 添加JavaScript以實現自動聚焦
+def auto_focus_js():
+    return components.html(
+        """
+        <script>
+            window.addEventListener('load', function() {
+                setTimeout(function() {
+                    const searchInput = document.querySelector('input[aria-label="輸入品牌名稱"]');
+                    if (searchInput) {
+                        searchInput.focus();
+                    }
+                }, 500);
+            });
+        </script>
+        """,
+        height=0,
+    )
+
+class DataValidator:
+    @staticmethod
+    def validate_excel_structure(df: pd.DataFrame) -> Tuple[bool, str]:
+        required_columns = [
+            '品牌', '產地', '品牌重點', '品牌等級', '種類', '一手價格', '二手參考價格 (一般參考)', 
+            'GL 定價 (全新)(GLB-1)', 'GL 定價 (全新)(GLB-2)', 'GL 定價 (全新)(GLF-1)', 'GL 定價 (全新)(GLF-2)', 
+            'GL 定價 (9成新)(GLB-1)', 'GL 定價 (9成新)(GLB-2)', 'GL 定價 (9成新)(GLF-1)', 'GL 定價 (9成新)(GLF-2)', 
+            'GL 定價 (一般)(1)', 'GL 定價 (一般)(2)', 'GL 定價 (一般)(3)', 'GL 定價 (一般)(4)', '備註', '特別備註', 
+            '二手平台價格範圍(HK$)- Carousell scraped', '二手平台平均價格(HK$)-Carousell scraped', 
+            '二手參考價格-AI(Perplexity)', 'AI (Websites Checked)', 
+            'GL 曾定價位1', 'GL 曾定價位2', 'GL 曾定價位3', 'GL 曾定價位4', 'GL 曾定價位5', 
+            'GL 曾定價位6', 'GL 曾定價位7', 'GL 曾定價位8', 'GL 曾定價位9', 'GL 曾定價位10', 
+            'GL 曾定價位11', 'GL 曾定價位12', 'GL 曾定價位13', 'GL 曾定價位14', 'GL 曾定價位15', 
+            'GL 曾定價位16', 'GL 曾定價位17', 'GL 曾定價位18', 'GL 曾定價位19', 'GL 曾定價位20'
+        ]
+        missing_columns = [col for col in required_columns if col not in df.columns]
+        if missing_columns:
+            return False, f"缺少必要欄位：{', '.join(missing_columns)}"
+        
+        critical_columns = ['品牌', '種類']
+        null_checks = df[critical_columns].isnull().sum()
+        if null_checks.any():
+            null_cols = [f"{col}({count}個)" for col, count in null_checks.items() if count > 0]
+            return False, f"關鍵欄位包含空值：{', '.join(null_cols)}"
+        
+        return True, "數據驗證通過"
+    
+    @staticmethod
+    def clean_price_data(price: any) -> str:
+        if pd.isna(price) or price is None or str(price).strip() in ["", "0.0", "0"]:
+            return "未提供"
+        try:
+            price_str = str(price).strip()
+            # Handle ranges like "100-200" by taking average
+            if '-' in price_str:
+                parts = [p.strip() for p in price_str.split('-') if p.strip()]
+                if len(parts) == 2:
+                    try:
+                        low = float(''.join(c for c in parts[0] if c.isdigit() or c == '.'))
+                        high = float(''.join(c for c in parts[1] if c.isdigit() or c == '.'))
+                        return f"{(low + high)/2:.2f}"
+                    except:
+                        pass
+            price_str = ''.join(c for c in price_str if c.isdigit() or c in ['.', '-'])
+            return price_str if price_str else "未提供"
+        except:
+            return "未提供"
+
+@st.cache_data(ttl=3600)
+def load_cached_data(_file_hash: str) -> Tuple[Optional[pd.DataFrame], Optional[str]]:
+    data_file = "temp_data.xlsx"
+    pickle_file = "temp_data.pkl"
+    if os.path.exists(pickle_file):
+        try:
+            df = pd.read_pickle(pickle_file)
+            non_price_columns = [col for col in df.columns if '價格' not in col and '定價' not in col]
+            df[non_price_columns] = df[non_price_columns].fillna('')
+            return df, None
+        except Exception as e:
+            pass  # Fall back to reading Excel
+    
+    if not os.path.exists(data_file):
+        return None, "檔案不存在"
+    try:
+        df = pd.read_excel(data_file)
+        non_price_columns = [col for col in df.columns if '價格' not in col and '定價' not in col]
+        df[non_price_columns] = df[non_price_columns].fillna('')
+        # Clean price columns
+        price_columns = [
+            '二手參考價格 (一般參考)', 
+            '二手平台平均價格(HK$)-Carousell scraped', '二手參考價格-AI(Perplexity)', 
+            'GL 定價 (全新)(GLB-1)', 'GL 定價 (全新)(GLB-2)', 'GL 定價 (全新)(GLF-1)', 'GL 定價 (全新)(GLF-2)', 
+            'GL 定價 (9成新)(GLB-1)', 'GL 定價 (9成新)(GLB-2)', 'GL 定價 (9成新)(GLF-1)', 'GL 定價 (9成新)(GLF-2)', 
+            'GL 定價 (一般)(1)', 'GL 定價 (一般)(2)', 'GL 定價 (一般)(3)', 'GL 定價 (一般)(4)'
+        ]
+        for col in price_columns:
+            if col in df.columns:
+                df[col] = df[col].apply(DataValidator.clean_price_data)
+        # Save to pickle for faster future loads
+        df.to_pickle(pickle_file)
+        return df, None
+    except Exception as e:
+        return None, f"加載數據時出錯: {e}"
+
+def save_data(df: pd.DataFrame, file_path: str, pickle_path: str) -> Tuple[bool, Optional[str]]:
+    try:
+        df = df.fillna('')
+        df.to_excel(file_path, index=False)
+        df.to_pickle(pickle_path)
+        return True, None
+    except Exception as e:
+        return False, f"保存數據時出錯: {e}"
+
+class BrandSearch:
+    def __init__(self, data: pd.DataFrame):
+        self.data = data
+        self.brands = self._get_unique_brands()
+        
+    @lru_cache(maxsize=1)
+    def _get_unique_brands(self):
+        return [b for b in self.data['品牌'].unique() if isinstance(b, str) and b.strip()]
+        
+    @lru_cache(maxsize=512)
+    def search_brand(self, query: str, threshold: int = 30) -> list:
+        if not query or not isinstance(query, str):
+            return []
+        matches = process.extract(query, self.brands, scorer=fuzz.token_sort_ratio, limit=10)
+        matched_brands = [(brand, score) for brand, score, _ in matches if score >= threshold]
+        matched_brands.sort(key=lambda x: x[1], reverse=True)
+        return matched_brands
+        
+    @lru_cache(maxsize=128)
+    def get_brand_data(self, brand: str) -> pd.DataFrame:
+        if not brand or not isinstance(brand, str):
+            return pd.DataFrame()
+        return self.data[self.data['品牌'] == brand]
+        
+    def search_by_category(self, brand: str, category: str) -> pd.DataFrame:
+        if not brand or not category or not isinstance(brand, str) or not isinstance(category, str):
+            return pd.DataFrame()
+        results = self.data[(self.data['品牌'] == brand) & (self.data['種類'] == category)]
+        return results
+    
+    def filter_by_category(self, results: pd.DataFrame, category: str) -> pd.DataFrame:
+        if not isinstance(category, str) or results.empty:
+            return results
+        if not category or category == "全部":
+            return results
+        return results[results['種類'] == category]
+
+def display_results(results: pd.DataFrame, brand: str, searcher: BrandSearch, selected_store: str = "All"):
+    if results.empty:
+        return None, "沒有找到匹配的結果。請選擇其他種類或重新搜索。"
+    
+    result_cards = []
+    
+    # General info from first row
+    if not results.empty:
+        row0 = results.iloc[0]
+        brand = row0.get('品牌', '未知品牌')
+        origin = row0.get('產地', '未知產地')
+        brand_focus = row0.get('品牌重點', '無品牌重點')
+        brand_level = row0.get('品牌等級', '無等級')
+        
+        general_html = (
+            f"""
+            <div class="result-card big-text">
+                <h3>品牌：{brand}</h3>
+                <p>產地：{origin}</p>
+                <p>品牌重點：{brand_focus}</p>
+                <p>品牌等級：{brand_level}</p>
+            </div>
+            """
+        )
+        result_cards.append(general_html)
+    
+    # Price table
+    all_columns = [
+        '種類', '一手價格',
+        'GL 定價 (全新)(GLB-1)', 'GL 定價 (全新)(GLB-2)', 'GL 定價 (全新)(GLF-1)', 'GL 定價 (全新)(GLF-2)',
+        'GL 定價 (9成新)(GLB-1)', 'GL 定價 (9成新)(GLB-2)', 'GL 定價 (9成新)(GLF-1)', 'GL 定價 (9成新)(GLF-2)',
+        'GL 定價 (一般)(1)', 'GL 定價 (一般)(2)', 'GL 定價 (一般)(3)', 'GL 定價 (一般)(4)'
+    ]
+    
+    all_headers = [
+        '種類', '一手價格',
+        'GLB 定價 (全新) - 1', 'GLB 定價 (全新) - 2', 'GLF 定價 (全新) - 1', 'GLF 定價 (全新) - 2',
+        'GLB 定價 (9成新) - 1', 'GLB 定價 (9成新) - 2', 'GLF 定價 (9成新) - 1', 'GLF 定價 (9成新) - 2',
+        '一般定價 - 1', '一般定價 - 2', '一般定價 - 3', '一般定價 - 4'
+    ]
+    
+    glb_columns = [all_columns[i] for i in [0,1,2,3,6,7,10,11,12,13]]
+    glb_headers = [all_headers[i] for i in [0,1,2,3,6,7,10,11,12,13]]
+    
+    glf_columns = [all_columns[i] for i in [0,1,4,5,8,9,10,11,12,13]]
+    glf_headers = [all_headers[i] for i in [0,1,4,5,8,9,10,11,12,13]]
+    
+    if selected_store == "GLB":
+        columns = glb_columns
+        headers = glb_headers
+    elif selected_store == "GLF":
+        columns = glf_columns
+        headers = glf_headers
+    else:
+        columns = all_columns
+        headers = all_headers
+    
+    available_columns = [col for col in columns if col in results.columns]
+    table_df = results[available_columns].fillna("暫無資料").replace({"": "暫無資料", "未提供": "暫無資料", "-": "暫無資料"})
+    
+    # Column classes
+    column_classes = {}
+    for i, col in enumerate(columns):
+        header = headers[i]
+        if 'GLB' in header:
+            column_classes[col] = 'glb-column'
+        elif 'GLF' in header:
+            column_classes[col] = 'glf-column'
+        else:
+            column_classes[col] = ''
+    
+    table_html = '<table><thead><tr>' + ''.join(f'<th class="{column_classes.get(col, "")}">{headers[columns.index(col)]}</th>' for col in available_columns) + '</tr></thead><tbody>'
+    for _, row in table_df.iterrows():
+        table_html += '<tr>' + ''.join(f'<td class="{column_classes.get(col, "")}">{row[col]}</td>' for col in available_columns) + '</tr>'
+    table_html += '</tbody></table>'
+    
+    # Collect remarks
+    remarks = set()
+    special_remarks = set()
+    for _, row in results.iterrows():
+        rem = str(row.get('備註', '')).strip()
+        if rem:
+            remarks.add(rem)
+        sp_rem = str(row.get('特別備註', '')).strip()
+        if sp_rem:
+            special_remarks.add(sp_rem)
+    
+    remarks_html = '<p><b>備註：</b> ' + '<br>'.join(remarks) + '</p>' if remarks else '所有資料只供參考，實際價格根據貨品狀況而定'
+    special_remarks_html = '<p><b>特別備註：</b> ' + '<br>'.join(special_remarks) + '</p>' if special_remarks else ''
+    
+    price_html = (
+        f"""
+        <div class="result-card big-text">
+            {table_html}
+            {remarks_html}
+            {special_remarks_html}
+        </div>
+        """
+    )
+    result_cards.append(price_html)
+    
+    return result_cards, f"找到 {len(results)} 個匹配結果"
+
+def get_match_class(score: int) -> str:
+    if score >= 90:
+        return "high-match"
+    elif score >= 60:
+        return "medium-match"
+    else:
+        return "low-match"
+
+def main():
+    st.title("Green Ladies 品牌價格查詢系統")
+    auto_focus_js()
+    
+    data_file = "temp_data.xlsx"
+    pickle_file = "temp_data.pkl"
+    
+    def validate_and_save_file(uploaded_file, file_path, pickle_path):
+        try:
+            df = pd.read_excel(uploaded_file)
+            # Clean price columns first
+            price_columns = [
+                '二手參考價格 (一般參考)', 
+                '二手平台平均價格(HK$)-Carousell scraped', '二手參考價格-AI(Perplexity)', 
+                'GL 定價 (全新)(GLB-1)', 'GL 定價 (全新)(GLB-2)', 'GL 定價 (全新)(GLF-1)', 'GL 定價 (全新)(GLF-2)', 
+                'GL 定價 (9成新)(GLB-1)', 'GL 定價 (9成新)(GLB-2)', 'GL 定價 (9成新)(GLF-1)', 'GL 定價 (9成新)(GLF-2)', 
+                'GL 定價 (一般)(1)', 'GL 定價 (一般)(2)', 'GL 定價 (一般)(3)', 'GL 定價 (一般)(4)'
+            ]
+            for col in price_columns:
+                if col in df.columns:
+                    df[col] = df[col].apply(DataValidator.clean_price_data)
+            is_valid, message = DataValidator.validate_excel_structure(df)
+            if is_valid:
+                success, error = save_data(df, file_path, pickle_path)
+                if success:
+                    load_cached_data.clear()
+                    return df, True, message, len(df)
+                else:
+                    return None, False, error, 0
+            return None, False, message, 0
+        except Exception as e:
+            return None, False, f"加載數據時出錯: {e}", 0
+    
+    with st.sidebar:
+        st.header("數據管理")
+        uploaded_file = st.file_uploader("上傳品牌數據 Excel 文件", type=['xlsx', 'xls'])
+        if uploaded_file is not None:
+            with st.spinner("正在驗證和保存數據..."):
+                df, is_valid, message, record_count = validate_and_save_file(uploaded_file, data_file, pickle_file)
+                if is_valid:
+                    st.success(f"數據已成功上傳並驗證: {record_count} 筆記錄")
+                    with st.expander("預覽數據"):
+                        st.dataframe(df.head(10))
+                else:
+                    st.error(f"數據驗證失敗: {message} 請檢查文件並重新上傳。")
+    
+    st.header("品牌搜索")
+    if not os.path.exists(data_file):
+        st.warning("請先上傳品牌數據文件")
+        return
+    
+    file_hash = hashlib.md5(Path(data_file).read_bytes()).hexdigest() if os.path.exists(data_file) else ""
+    with st.spinner("正在加載數據..."):
+        data, error = load_cached_data(file_hash)
+    if error:
+        st.error(f"{error} 請重試。")
+        if st.button("重試加載", key="retry_load"):
+            st.rerun()
+        return
+    searcher = BrandSearch(data)
+    
+    all_categories = sorted([c for c in data['種類'].unique() if isinstance(c, str) and c.strip()])
+    category_options = ["全部"] + all_categories
+    
+    if 'search_performed' not in st.session_state:
+        st.session_state.search_performed = False
+    if 'search_results' not in st.session_state:
+        st.session_state.search_results = pd.DataFrame()
+    if 'original_results' not in st.session_state:
+        st.session_state.original_results = pd.DataFrame()
+    if 'showing_brand_select' not in st.session_state:
+        st.session_state.showing_brand_select = False
+    if 'selected_brand' not in st.session_state:
+        st.session_state.selected_brand = None
+    if 'last_category' not in st.session_state:
+        st.session_state.last_category = "全部"
+    if 'update_query' not in st.session_state:
+        st.session_state.update_query = False
+    if 'temp_brand' not in st.session_state:
+        st.session_state.temp_brand = ''
+    if 'previous_query' not in st.session_state:
+        st.session_state.previous_query = ''
+
+    def on_category_change():
+        if st.session_state.search_performed and not st.session_state.original_results.empty:
+            selected_category = st.session_state.category_select
+            with st.spinner("正在過濾種類..."):
+                filtered_results = searcher.filter_by_category(st.session_state.original_results, selected_category)
+                st.session_state.search_results = filtered_results
+
+    col1, col2 = st.columns([3, 2])
+    with col1:
+        with st.form(key="search_form", clear_on_submit=False):
+            if st.session_state.update_query:
+                st.session_state.search_input = st.session_state.temp_brand
+                st.session_state.update_query = False
+            query = st.text_input(
+                "輸入品牌名稱",
+                key="search_input",
+                help="輸入品牌名稱進行模糊搜索"
+            )
+            search_button = st.form_submit_button("搜索", help="搜索品牌", use_container_width=True, type="primary")
+    with col2:
+        selected_category = st.selectbox(
+            "選擇種類",
+            category_options,
+            key="category_select",
+            on_change=on_category_change
+        )
+
+    # Reset results when query changes
+    if st.session_state.previous_query != query:
+        st.session_state.search_performed = False
+        st.session_state.showing_brand_select = False
+        st.session_state.previous_query = query
+    
+    if search_button and query:
+        st.session_state.search_performed = False
+        st.session_state.showing_brand_select = False
+        with st.spinner("正在搜索..."):
+            matched_brands = searcher.search_brand(query)
+            if not matched_brands:
+                st.warning("沒有找到匹配的品牌。請重新搜索。")
+                if st.button("重新搜索", key="retry_search_no_match"):
+                    st.session_state.search_input = ""
+                    st.session_state.previous_query = ""
+                    st.rerun()
+            else:
+                high_matches = [(brand, score) for brand, score in matched_brands if score >= 95]
+                if len(high_matches) == 1 and len(matched_brands) == 1:
+                    selected_brand = high_matches[0][0]
+                    match_score = high_matches[0][1]
+                    results = searcher.get_brand_data(selected_brand)
+                    filtered_results = searcher.filter_by_category(results, selected_category)
+                    st.session_state.original_results = results
+                    st.session_state.selected_brand = selected_brand
+                    st.session_state.search_results = filtered_results
+                    st.session_state.search_performed = True
+                    st.session_state.showing_brand_select = False
+                    st.session_state.last_category = selected_category
+                    st.markdown(f"<p class='high-match'>已自動選擇最佳匹配: {selected_brand} (匹配度: {int(match_score)}%)</p>", unsafe_allow_html=True)
+                else:
+                    brand_options = []
+                    for brand, score in matched_brands:
+                        match_class = get_match_class(score)
+                        brand_options.append(f"{brand} (匹配度: {int(score)}%)")
+                    st.session_state.showing_brand_select = True
+                    st.session_state.brand_options = brand_options
+                    st.session_state.matched_brands = [brand for brand, _ in matched_brands]
+                    st.session_state.matched_scores = [score for _, score in matched_brands]
+                    st.session_state.search_performed = False
+                    st.session_state.search_results = pd.DataFrame()
+                    st.session_state.original_results = pd.DataFrame()
+                    st.session_state.selected_brand = None
+    
+    if st.session_state.showing_brand_select:
+        st.subheader("請選擇最匹配的品牌:")
+        for i, option in enumerate(st.session_state.brand_options):
+            brand = st.session_state.matched_brands[i]
+            score = st.session_state.matched_scores[i]
+            match_class = get_match_class(score)
+            col1, col2 = st.columns([3, 1])
+            with col1:
+                st.markdown(f"<p class='{match_class}'>{option}</p>", unsafe_allow_html=True)
+            with col2:
+                if st.button(f"選擇", key=f"select_{i}"):
+                    results = searcher.get_brand_data(brand)
+                    filtered_results = searcher.filter_by_category(results, selected_category)
+                    st.session_state.original_results = results
+                    st.session_state.selected_brand = brand
+                    st.session_state.search_results = filtered_results
+                    st.session_state.search_performed = True
+                    st.session_state.showing_brand_select = False
+                    st.session_state.last_category = selected_category
+                    st.rerun()
+    
+    if st.session_state.search_performed and st.session_state.selected_brand:
+        selected_store = st.selectbox("店舖Store", ["All", "GLB", "GLF"], key="store_select")
+        with st.spinner("正在生成結果..."):
+            result_cards, success_message = display_results(st.session_state.search_results, st.session_state.selected_brand, searcher, selected_store)
+            if result_cards is None:
+                st.warning(success_message)
+                if st.button("重新搜索", key="retry_search_no_results"):
+                    st.session_state.search_input = ""
+                    st.session_state.previous_query = ""
+                    st.rerun()
+            else:
+                st.success(success_message)
+                for card in result_cards:
+                    st.markdown(card, unsafe_allow_html=True)
+                col1, col2 = st.columns(2)
+                with col1:
+                    st.markdown("""
+                    <div class="result-card big-text">
+                        <h4 style="text-align:center; color:#1976d2; margin-bottom:15px;">品牌等級 × 一手價格參考表</h4>
+                        <table style="width:100%; border-collapse:collapse; margin-top:10px;">
+                            <thead>
+                                <tr style="background-color:#37474f; color:white;">
+                                    <th style="padding:10px; border:1px solid black;">品牌等級</th>
+                                    <th style="padding:10px; border:1px solid black;">一手價格範圍</th>
+                                    <th style="padding:10px; border:1px solid black;">主要參考品牌</th>
+                                </tr>
+                            </thead>
+                            <tbody>
+                                <tr style="background-color:#fff8e1;">
+                                    <td style="padding:10px; border:1px solid black; font-weight:bold;">Low<br>(低價品牌)</td>
+                                    <td style="padding:10px; border:1px solid black;">$100 ~ &lt;$1,000</td>
+                                    <td style="padding:10px; border:1px solid black;">H&M, Uniqlo, Cotton ON+, 低價快時尚, 批發, 淘寶等</td>
+                                </tr>
+                                <tr>
+                                    <td style="padding:10px; border:1px solid black; font-weight:bold;">Low/Middle<br>(低中價品牌)</td>
+                                    <td style="padding:10px; border:1px solid black;">$1,000 ~ $2,000</td>
+                                    <td style="padding:10px; border:1px solid black;">Mango, GAP, Levi's, Tommy Hilfiger</td>
+                                </tr>
+                                <tr style="background-color:#e8f5e9;">
+                                    <td style="padding:10px; border:1px solid black; font-weight:bold;">Middle<br>(中價品牌)</td>
+                                    <td style="padding:10px; border:1px solid black;">$2,000 ~ $5,000</td>
+                                    <td style="padding:10px; border:1px solid black;">Coach, DKNY, Ted Baker</td>
+                                </tr>
+                                <tr>
+                                    <td style="padding:10px; border:1px solid black; font-weight:bold;">Middle/High<br>(中高價品牌)</td>
+                                    <td style="padding:10px; border:1px solid black;">$5,000 ~ $8,000</td>
+                                    <td style="padding:10px; border:1px solid black;">Maje, Hugo Boss, Michael Kors</td>
+                                </tr>
+                                <tr style="background-color:#fff3e0;">
+                                    <td style="padding:10px; border:1px solid black; font-weight:bold;">High<br>(高價品牌)</td>
+                                    <td style="padding:10px; border:1px solid black;">$8,000 ~ $20,000</td>
+                                    <td style="padding:10px; border:1px solid black;">Max Mara, Paul Smith, Dsquared2</td>
+                                </tr>
+                                <tr style="background-color:#fce4ec;">
+                                    <td style="padding:10px; border:1px solid black; font-weight:bold; color:#c51162;">Luxury<br>(奢侈品牌)</td>
+                                    <td style="padding:10px; border:1px solid black;">$20,000 ~ $80,000</td>
+                                    <td style="padding:10px; border:1px solid black;">Chanel, Gucci, Louis Vuitton, Hermès</td>
+                                </tr>
+                                <tr style="background-color:#f3e5f5;">
+                                    <td style="padding:10px; border:1px solid black; font-weight:bold; color:#7b1fa2;">Extreme Luxury<br>(極致奢侈)</td>
+                                    <td style="padding:10px; border:1px solid black;">$80,000 ~ $800,000+</td>
+                                    <td style="padding:10px; border:1px solid black;">Hermès稀有款, Stefano Ricci, 私人訂制</td>
+                                </tr>
+                            </tbody>
+                        </table>
+                        <p style="text-align:right; font-size:12px; color:#666; margin-top:8px;">
+                            ※ 以上為一般參考範圍，實際價格會因款式、物料、年份而有差異
+                        </p>
+                    </div>
+                    """, unsafe_allow_html=True)
+
+if __name__ == "__main__":
+    try:
+        main()
+    except Exception as e:
+        st.error(f"應用程式發生錯誤: {str(e)} 請重試。")
+        if st.button("重試", key="retry_global"):
+            st.rerun()
